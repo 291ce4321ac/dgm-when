@@ -12,6 +12,12 @@ function when(func_name)
 %  function exists in the current version of MATLAB.  There is no practical and 
 %  general method to find introduction or removal dates for a function which has
 %  been removed from MATLAB.  Keep that in mind if you're using an older version.
+% 
+%  Some attempt has been made to detect cases where a function has been renamed,
+%  but due to multiple factors, the chances of correctly detecting these cases 
+%  are very low.  Failure to detect a renaming event will result either in the 
+%  absence of information relevant to the change, or a message inaccurately
+%  indicating that the function has been removed.
 %
 %  FUNCTIONNAME specifies the function to look up. (case-insensitive)
 %    This parameter may be a char vector or a cell array of char vectors.
@@ -25,7 +31,7 @@ function when(func_name)
 %   ## images.roi.assistedfreehand.createmask -- Introduced in R2018b
 %   ## dicomcontours.createmask -- Introduced in R2020b
 %
-%   func_name = {'plot','urlread','webread','wavread','isgray'};
+%   func_name = {'plot','urlread','webread','wavread','isgray','caxis'};
 %   when(func_name)
 %   ## plot -- Introduced before R2006a
 %   ## urlread -- Introduced before R2006a
@@ -34,6 +40,8 @@ function when(func_name)
 %				  If this is part of MATLAB, it may have been removed before R2019b
 %   ## isgray -- Exists, but no online documentation found
 %                Function may have been removed between R2019b and R2021a
+%   ## clim -- Introduced before R2006a
+%              caxis was renamed to clim in R2022a
 %
 % See also: which, whos
 
@@ -44,6 +52,7 @@ function when(func_name)
 %	allow lookup of functions not in the current installation (due to version or missing toolbox)
 %	accomodate for functions where the webdocs URL cannot be naively predicted (e.g. createMask)
 %   allow function name cell array to have any geometry
+%   try to check for name changes
 
 % When() determines the introduction version by scraping webdocs.  This has
 % unfortunate limitations.  When() will attempt to guess the webdocs URL directly.
@@ -79,7 +88,7 @@ function when(func_name)
 % page for every version, compounding the already obscenely slow access times.  
 % 
 % There are PDF release notes available back to ~R2012b, but as far as I can tell, the PDF release notes only cover 
-% base MATLAB, but not all the toolboxes.  I haven't found any corresponding PDF release notes for other toolboxes.
+% base MATLAB, but not all the toolboxes.  RN for other toolboxes may go back further; older copies can also occasionally be found.
 %
 % It might be possible to scrape either web or PDF RN now and build a lookup table for runtime use, but it would still 
 % only cover core tools back to R2012b, and the rest of common toolboxes back to R2018a.  The task of scraping either 
@@ -88,6 +97,19 @@ function when(func_name)
 
 % removed, but still has webdocs: hdftool(2020a)
 % removed, and webdocs removed: isSingleReadPerFile(2020a), profilereport(2020b), isgray, isbw, isrgb, wavread
+
+% the issue of renamed functions is another problem to resolve
+% https://www.mathworks.com/help/matlab/ref/clim.html
+% caxis() and clim() both redirect to the same page and return the same date (<R2006a)
+% even though clim() was not available until R2022a
+% these changes are mentioned in the header, but not consistently
+% sometimes the date is missing; sometimes there's a note at the end of the page
+%
+% in this specific case, the url guessing works because the mathworks site redirects
+% but if it were to fail and fallback to a web search, it would fail the websearch 
+% because none of the results contain the queried function name
+% there isn't a good way to detect renamed cases if this happens
+
 
 forcesearch = false; % for testing
 
@@ -107,12 +129,13 @@ function checkFunctionName(fname,forcesearch)
 	fname = lower(fname);
 	
 	% i'm not doing any type checks on fname.  
-	% it's unnecessary and tends to cause problems which prevent valid queries
+	% it's unnecessary and causes problems which prevent valid queries
 	% for example, checking functions which aren't included in the current installation
 
 	if ~forcesearch
 		% try guessing the url directly 
-		% if this works, it is compatible <R2006a
+		% if this works, it's faster and compatible <R2006a
+		% guessing and hoping for a redirect also improves our chances of finding renamed functions
 		url = ['https://mathworks.com/help/matlab/ref/' fname '.html'];
 		[str status] = urlread(url); %#ok<*URLRD> % webread() creates version dependency (R2014b)
 		if ~status
@@ -151,6 +174,7 @@ function checkFunctionName(fname,forcesearch)
 			urllist = {S.items(:).link}.';
 			% only allow urls that end in '.fname.html' or '/fname.html'
 			% no, i'm not using contains(), as it introduces version dependency (R2016b)
+			% this will fail if the function has been renamed.  function will be reported as removed.
 			urllist = urllist(~cellfun(@isempty,regexp(urllist,sprintf('(\\/|\\.)%s\\.html',fname),'start')));
 		end
 		
@@ -191,15 +215,49 @@ function checkFunctionName(fname,forcesearch)
 		str = C{c};
 		fname = FN{c};
 		
+		% get the main release version info string
 		outstr = regexp(str,'>(Introduced \w+ R20\d{2}(a|b))<','tokens');
 		
-		if isempty(outstr)
-			outstr = 'No release information found on webdocs page';
-		else
-			outstr = outstr{1}{1};
+		% there are so few examples of renamed functions that it's hard to expect formatting 
+		% to be consistent enough for this to be reliable
+		% there are some classes for which this doesn't work, 
+		% but let's not overcomplicate something that can never be robust
+		renameexpr = ['<span class="icon\-arrow\-open\-right"></span>(R20\d{2}(a|b)): ' ...
+					  '<span class="remove_bold">Renamed from <code class="literal">(\w+)</code>'];		
+		renamemsg = regexp(str,renameexpr,'tokens');
+		
+		% need to get actual current name, since fname/urllist are derived from user input
+		% afnexpr = '<title>.+- MATLAB (\w+)</title>'; % doesn't always work
+		afnexpr = '<link rel="canonical" href="http[:/\w\.]+/([^/]+).html'; % try this
+		actualfname = regexp(str,afnexpr,'tokens');
+		if ~isempty(actualfname)
+			fname = actualfname{1}{1};
 		end
 		
-		fprintf('## <a href="%s">%s</a> -- %s\n',urllist{c},fname,outstr);
+		if isempty(outstr)
+			% page exists, but can't find release info
+			outstr = 'No release information found on webdocs page';
+			fprintf('## <a href="%s">%s</a> -- %s\n',urllist{c},fname,outstr);
+		else
+			% release info found
+			fprintf('## <a href="%s">%s</a> -- %s\n',urllist{c},fname,outstr{1}{1});
+			
+			if ~isempty(renamemsg)
+				% rename info found
+				offsetblock = repmat(' ',[1 numel(fname)+7]);
+				if isempty(actualfname)
+					% if the actual fname isn't reliably known, this just simplifies the output in cases
+					% where a guessed fname is the same as the old fname.  in that scenario,
+					% the default output would result in "x was renamed to x" which is pointless and confusing.
+					% returning just "x was renamed" is ambiguous, but it's the sum of available information.
+					% bear in mind that rename detection cannot occur unless the url was guessed and redirected
+					% so if we're here, fname in FN comes from user input, not from the url (what a mess!)
+					fprintf('%s%s was renamed in %s\n',offsetblock,renamemsg{1}{2},renamemsg{1}{1});
+				else
+					fprintf('%s%s was renamed to %s in %s\n',offsetblock,renamemsg{1}{2},fname,renamemsg{1}{1});
+				end
+			end
+		end
 	end
 
 end
